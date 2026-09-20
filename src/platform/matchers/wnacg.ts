@@ -1,8 +1,21 @@
 import { GalleryMeta } from "../../download/gallery-meta";
 import ImageNode from "../../img-node";
 import { Chapter } from "../../page-fetcher";
+import { evLog } from "../../utils/ev-log";
 import { ADAPTER } from "../adapt";
 import { BaseMatcher, OriginMeta, Result } from "../platform";
+
+/** how many pages an album index page lists, only used to guess the chunk size when an
+ *  album index page cannot be fetched */
+const PAGES_PER_INDEX_PAGE = 12;
+
+/** a thumbnail parsed from an album index page */
+type Thumbnail = {
+  /** The page number of this thumbnail, counted by the album index page order and the position
+   *  inside that page. It is not read from the page markup, see `extractThumbnails()`. */
+  pageNumber: number,
+  url: string,
+}
 
 class WnacgMatcher extends BaseMatcher<GalleryImage[]> {
   meta?: GalleryMeta;
@@ -17,24 +30,50 @@ class WnacgMatcher extends BaseMatcher<GalleryImage[]> {
     this.baseURL = `${window.location.origin}/photos-index-page-1-aid-${id}.html`;
     this.galleryURL = `${window.location.origin}/photos-gallery-aid-${id}.html`;
 
-    let doc = await window.fetch(this.baseURL).then((res) => res.text()).then((text) => new DOMParser().parseFromString(text, "text/html"));
-    this.meta = this.pasrseGalleryMeta(doc);
+    // The first album index page is also the page holding the gallery meta.
+    let indexDoc = await this.requestDocument(this.baseURL);
+    this.meta = this.pasrseGalleryMeta(indexDoc);
 
-    let galleryImageList = await this.requestGalleryImages(this.galleryURL);
-    yield Result.ok(galleryImageList);
+    // The gallery page only provides the large image urls
+    const imageList = await this.requestGalleryImages(this.galleryURL);
+    if (imageList.length === 0) throw new Error("Cannot find any image in this gallery");
 
+    // Take thumbnail page by page
+    const indexPageCount = this.extractIndexPageCount(indexDoc, imageList.length);
+    let position = 0;
+    for (let page = 1; page <= indexPageCount; page++) {
+      let thumbnails: Thumbnail[] = [];
+      if (page === 1) {
+        // Reuse the base doc (which includes first 12 thumbnail)
+        thumbnails = this.extractThumbnails(indexDoc, position);
+      } else {
+        const thumbnailPage = `${window.location.origin}/photos-index-page-${page}-aid-${id}.html`;
+        const doc = await this.requestDocument(thumbnailPage)
+          .catch((error) => {
+            evLog("error", `wnacg: cannot fetch album index page ${page}, thumbnails are skipped:`, error);
+            return undefined;
+          });
+        if (doc) thumbnails = this.extractThumbnails(doc, position);
+      }
+
+      thumbnails.forEach((thumbnail) => {
+        const img = imageList[thumbnail.pageNumber - 1];
+        if (img) img.thumbnail = thumbnail.url;
+      });
+
+      // If any thumbnail page failed to get, use PAGES_PER_INDEX_PAGE as default (align position)
+      const count = thumbnails.length || PAGES_PER_INDEX_PAGE
+      const chunk = imageList.slice(position, position + count);
+      position += chunk.length;
+
+      if (chunk.length > 0) yield Result.ok(chunk);
+    }
+    // Shoud not happen
+    if (position < imageList.length) yield Result.ok(imageList.slice(position));
   }
 
   async parseImgNodes(list: GalleryImage[]): Promise<ImageNode[]> {
-
-    const result: ImageNode[] = [];
-
-    for (let index = 0; index < list.length; index++) {
-      const img = list[index];
-      let imgNode = new ImageNode("", img.url, img.caption, undefined, img.url);
-      result.push(imgNode);
-    }
-    return result;
+    return list.map((img) => new ImageNode(img.thumbnail || "", img.url, img.caption, undefined, img.url));
   }
 
   async fetchOriginMeta(node: ImageNode): Promise<OriginMeta> {
@@ -63,6 +102,47 @@ class WnacgMatcher extends BaseMatcher<GalleryImage[]> {
     const description = Array.from(doc.querySelector(".asTB > .asTBcell.uwconn > p")?.childNodes || []).map(e => e.textContent).filter(Boolean) as string[];
     meta.tags = { "tags": tags, "description": description }
     return meta;
+  }
+
+  private async requestDocument(url: string): Promise<Document> {
+    return window.fetch(url)
+      .then((res) => res.text())
+      .then((text) => new DOMParser().parseFromString(text, "text/html"));
+  }
+
+  /** The album index pages list every page of the album, 12 pages per index page. */
+  private extractIndexPageCount(doc: Document, imageCount: number): number {
+    let lastPage = 1;
+    doc.querySelectorAll<HTMLAnchorElement>(".paginator a").forEach((ele) => {
+      const page = ele.getAttribute("href")?.match(/photos-index-page-(\d+)-aid-/)?.[1];
+      if (page) lastPage = Math.max(lastPage, parseInt(page, 10));
+    });
+    const perPage = doc.querySelectorAll(".gallary_wrap li.gallary_item").length || PAGES_PER_INDEX_PAGE;
+    return Math.max(lastPage, Math.ceil(imageCount / perPage));
+  }
+
+  /** Parse the thumbnails of an album index page */
+  private extractThumbnails(doc: Document, offset: number): Thumbnail[] {
+    const thumbnails: Thumbnail[] = [];
+    doc.querySelectorAll<HTMLLIElement>(".gallary_wrap li.gallary_item").forEach((ele, indexInPage) => {
+      const src = ele.querySelector<HTMLImageElement>(".pic_box img")?.getAttribute("src");
+      if (!src) return;
+      thumbnails.push({
+        pageNumber: offset + indexInPage + 1,
+        url: this.toAbsoluteURL(src),
+      });
+    });
+    return thumbnails;
+  }
+
+  /** Thumbnail urls are protocol relative, eg: //baseURL/data/t/3860/55/xxx.webp */
+  private toAbsoluteURL(src: string): string {
+    try {
+      return new URL(src, this.baseURL).href;
+    } catch (error) {
+      evLog("error", "wnacg: invalid thumbnail url:", src, error);
+      return src;
+    }
   }
 
   private async requestGalleryImages(galleryURL: string): Promise<GalleryImage[]> {
@@ -125,6 +205,7 @@ class WnacgMatcher extends BaseMatcher<GalleryImage[]> {
 type GalleryImage = {
   url: string;
   caption: string;
+  thumbnail?: string;
 }
 ADAPTER.addSetup({
   name: "绅士漫画",
